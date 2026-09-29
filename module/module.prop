@@ -1,6 +1,6 @@
 id=xbox-bluetooth-rumble-bridge
 name=Xbox Bluetooth Rumble Bridge
-version=v0.3.0
-versionCode=3
+version=v0.4.0
+versionCode=4
 author=Purplefin
-description=Bridges Bluetooth 045e:02fd gamepad input and two-motor rumble through a virtual Android controller.
+description=Bridges Bluetooth 045e:02fd gamepads to virtual Android controllers with two-motor rumble.

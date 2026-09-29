@@ -27,7 +27,16 @@ typedef unsigned long u64;
 #define UI_FF_UPLOAD 1
 #define UI_FF_ERASE 2
 #define CLOCK_MONOTONIC 1
+#define MAX_CONTROLLERS 8
+#define MAX_EVENTS 64
+#define SCAN_INTERVAL_MS 2000
 
+#ifdef BRIDGE_TEST
+long test_sc3(long n,long a,long b,long c);
+long test_sc4(long n,long a,long b,long c,long d);
+static long sc3(long n,long a,long b,long c){return test_sc3(n,a,b,c);}
+static long sc4(long n,long a,long b,long c,long d){return test_sc4(n,a,b,c,d);}
+#else
 static long sc3(long n,long a,long b,long c) {
     register long x0 __asm__("x0")=a, x1 __asm__("x1")=b, x2 __asm__("x2")=c;
     register long x8 __asm__("x8")=n;
@@ -40,6 +49,7 @@ static long sc4(long n,long a,long b,long c,long d) {
     __asm__ volatile("svc #0" : "+r"(x0) : "r"(x1),"r"(x2),"r"(x3),"r"(x8) : "memory");
     return x0;
 }
+#endif
 static long op(const char *p,int flags){return sc4(SYS_openat,AT_FDCWD,(long)p,flags,0);}
 static long rd(long f,void *b,u64 n){return sc3(SYS_read,f,(long)b,n);}
 static long wr(long f,const void *b,u64 n){return sc3(SYS_write,f,(long)b,n);}
@@ -77,45 +87,51 @@ _Static_assert(sizeof(struct input_event)==24,"input_event ABI");
 _Static_assert(sizeof(struct ff_effect)==48,"ff_effect ABI");
 _Static_assert(sizeof(struct upload)==104,"uinput upload ABI");
 
-static struct rumble_effect effects[16];
-static long hid=-1;
-static enum report_profile profile=REPORT_UNKNOWN;
-static u16 playing_strong=0,playing_weak=0;
+struct controller {
+    long src,hid,pad;
+    int event_index,active;
+    char hid_parent[256];
+    enum report_profile profile;
+    struct rumble_effect effects[16];
+    u16 playing_strong,playing_weak;
+};
+static struct controller controllers[MAX_CONTROLLERS];
+static u8 rejected[MAX_EVENTS];
+static s64 next_scan;
 static s64 now_ms(void){struct timespec t;if(sc3(SYS_clock_gettime,CLOCK_MONOTONIC,(long)&t,0)<0)return 0;return t.sec*1000+t.nsec/1000000;}
-static void rumble(u16 a,u16 b){
-    if(a==playing_strong&&b==playing_weak)return;
-    u8 pkt[9];int n=make_report(profile,a,b,pkt);
-    if(hid>=0&&n&&wr(hid,pkt,n)==n){playing_strong=a;playing_weak=b;}
-    else say("rumble report write failed\n");
+static int rumble(struct controller *c,u16 a,u16 b){
+    if(a==c->playing_strong&&b==c->playing_weak)return 0;
+    u8 pkt[9];int n=make_report(c->profile,a,b,pkt);
+    if(c->hid>=0&&n&&wr(c->hid,pkt,n)==n){c->playing_strong=a;c->playing_weak=b;return 0;}
+    say("rumble report write failed\n");return -1;
 }
-static void stop(void){if(playing_strong||playing_weak)rumble(0,0);}
-static void update_rumble(void){u16 a,b;mix_effects(effects,16,now_ms(),&a,&b);rumble(a,b);}
+static void stop(struct controller *c){if(c->playing_strong||c->playing_weak)rumble(c,0,0);}
+static int update_rumble(struct controller *c,s64 now){u16 a,b;mix_effects(c->effects,16,now,&a,&b);return rumble(c,a,b);}
 static int bit(const u8 *b,int k){return (b[k/8]>>(k%8))&1;}
-static long source(char *hid_parent){
+#ifndef BRIDGE_TEST
+static long source_candidate(int i,char *hid_parent){
     char path[96],num[12],name[96],parent[256];struct input_id id;
-    for(int i=0;i<64;i++){
-        copy(path,"/dev/input/event");number(num,i);copy(path+len(path),num);
-        long f=op(path,O_RDONLY);
-        if(f<0)continue;
-        zero(&id,sizeof(id));zero(name,sizeof(name));
-        if(io(f,EVIOCGID,(long)&id)>=0&&id.bustype==5&&id.vendor==0x045e&&id.product==0x02fd&&
-           io(f,EVIOCGNAME(96),(long)name)>0&&
-           !equal(name,"Xbox Bluetooth Rumble Bridge")&& !equal(name,"TT Max Rumble Bridge")){
-            u8 keys[96];zero(keys,sizeof(keys));
-            if(io(f,EVIOCGBIT(EV_KEY,sizeof(keys)),(long)keys)>=0&&bit(keys,304)){
-                copy(path,"/sys/class/input/event");number(num,i);copy(path+len(path),num);
-                copy(path+len(path),"/device/device");
-                long n=sc4(SYS_readlinkat,AT_FDCWD,(long)path,(long)parent,255);
-                if(n>0){parent[n]=0;copy(hid_parent,leaf(parent));return f;}
-            }
+    copy(path,"/dev/input/event");number(num,i);copy(path+len(path),num);
+    long f=op(path,O_RDONLY);
+    if(f<0)return -1;
+    zero(&id,sizeof(id));zero(name,sizeof(name));
+    if(io(f,EVIOCGID,(long)&id)>=0&&id.bustype==5&&id.vendor==0x045e&&id.product==0x02fd&&
+       io(f,EVIOCGNAME(96),(long)name)>0&&
+       !equal(name,"Xbox Bluetooth Rumble Bridge")&& !equal(name,"TT Max Rumble Bridge")){
+        u8 keys[96];zero(keys,sizeof(keys));
+        if(io(f,EVIOCGBIT(EV_KEY,sizeof(keys)),(long)keys)>=0&&bit(keys,304)){
+            copy(path,"/sys/class/input/event");number(num,i);copy(path+len(path),num);
+            copy(path+len(path),"/device/device");
+            long n=sc4(SYS_readlinkat,AT_FDCWD,(long)path,(long)parent,255);
+            if(n>0){parent[n]=0;copy(hid_parent,leaf(parent));return f;}
         }
-        closefd(f);
     }
+    closefd(f);
     return -1;
 }
-static long hidraw(const char *hid_parent){
+static long hidraw(const char *hid_parent,enum report_profile *profile){
     char path[128],num[12],link[256];
-    for(int i=0;i<64;i++){
+    for(int i=0;i<MAX_EVENTS;i++){
         copy(path,"/sys/class/hidraw/hidraw");number(num,i);copy(path+len(path),num);copy(path+len(path),"/device");
         long n=sc4(SYS_readlinkat,AT_FDCWD,(long)path,(long)link,255);
         if(n<=0)continue;link[n]=0;
@@ -123,19 +139,22 @@ static long hidraw(const char *hid_parent){
             copy(path,"/sys/class/hidraw/hidraw");copy(path+len(path),num);
             copy(path+len(path),"/device/report_descriptor");
             long d=op(path,O_RDONLY);
-            if(d<0){say("HID descriptor not readable\n");return -1;}
+            if(d<0)return -3;
             u8 descriptor[2048];long size=rd(d,descriptor,sizeof(descriptor));closefd(d);
-            if(size<=0||size==(long)sizeof(descriptor)){say("HID descriptor invalid\n");return -1;}
-            profile=report_profile_from_descriptor(descriptor,(u32)size);
-            if(profile==REPORT_UNKNOWN){say("Unsupported HID output report 3; leaving controller untouched\n");return -1;}
+            if(size<=0||size==(long)sizeof(descriptor))return -3;
+            *profile=report_profile_from_descriptor(descriptor,(u32)size);
+            if(*profile==REPORT_UNKNOWN)return -2;
             copy(path,"/dev/hidraw");copy(path+len(path),num);
-            return op(path,O_WRONLY);
+            long f=op(path,O_WRONLY);
+            return f<0?-1:f;
         }
     }
     return -1;
 }
-static long virtual_pad(long src){
+static long virtual_pad(long src,int slot){
     long f=op("/dev/uinput",O_RDWR|O_NONBLOCK);if(f<0)return f;
+    char phys[32];copy(phys,"xbox-bridge/pad");number(phys+len(phys),slot);
+    if(io(f,_IOW(108,sizeof(char*)),(long)phys)<0)goto fail;
     u8 keys[96],axes[8];zero(keys,sizeof(keys));zero(axes,sizeof(axes));
     if(io(src,EVIOCGBIT(EV_KEY,sizeof(keys)),(long)keys)<0||io(src,EVIOCGBIT(EV_ABS,sizeof(axes)),(long)axes)<0)goto fail;
     if(io(f,_IOW(100,4),EV_KEY)<0||io(f,_IOW(100,4),EV_ABS)<0||io(f,_IOW(100,4),EV_FF)<0||io(f,_IOW(107,4),FF_RUMBLE)<0)goto fail;
@@ -151,65 +170,144 @@ static long virtual_pad(long src){
     return f;
 fail:closefd(f);return -1;
 }
-static void handle_ff(long pad,struct input_event *e){
+#else
+long test_source_candidate(int i,char *hid_parent);
+long test_hidraw(const char *hid_parent,enum report_profile *profile);
+long test_virtual_pad(long src,int slot);
+#define source_candidate test_source_candidate
+#define hidraw test_hidraw
+#define virtual_pad test_virtual_pad
+#endif
+static void close_controller(struct controller *c){
+    if(!c->active)return;
+    stop(c);
+    io(c->src,EVIOCGRAB,0);
+    io(c->pad,_IO(2),0);
+    closefd(c->pad);closefd(c->src);closefd(c->hid);
+    zero(c,sizeof(*c));
+}
+static int active_event(int index){
+    for(int i=0;i<MAX_CONTROLLERS;i++)if(controllers[i].active&&controllers[i].event_index==index)return 1;
+    return 0;
+}
+static int active_parent(const char *parent){
+    for(int i=0;i<MAX_CONTROLLERS;i++)if(controllers[i].active&&equal(controllers[i].hid_parent,parent))return 1;
+    return 0;
+}
+static int free_slot(void){for(int i=0;i<MAX_CONTROLLERS;i++)if(!controllers[i].active)return i;return -1;}
+static void reject(int event,int reason){
+    if(rejected[event]==reason)return;
+    rejected[event]=(u8)reason;
+    if(reason==2)say("Unsupported HID output report 3; leaving controller untouched\n");
+    else if(reason==3)say("HID descriptor not readable or invalid\n");
+    else if(reason==4)say("Could not create or grab virtual gamepad\n");
+    else if(reason==5)say("Initial stop report failed\n");
+    else say("Bluetooth hidraw not accessible\n");
+}
+static void scan_sources(void){
+    for(int event=0;event<MAX_EVENTS;event++){
+        if(active_event(event))continue;
+        int slot=free_slot();if(slot<0)break;
+        char parent[256];long src=source_candidate(event,parent);
+        if(src<0){rejected[event]=0;continue;}
+        if(active_parent(parent)){closefd(src);continue;}
+        enum report_profile profile=REPORT_UNKNOWN;
+        long hid=hidraw(parent,&profile);
+        if(hid<0){reject(event,(int)-hid);closefd(src);continue;}
+        u8 clear_report[9];int n=make_report(profile,0,0,clear_report);
+        if(n<=0||wr(hid,clear_report,n)!=n){reject(event,5);closefd(hid);closefd(src);continue;}
+        long pad=virtual_pad(src,slot);
+        if(pad<0){reject(event,4);closefd(hid);closefd(src);continue;}
+        if(io(src,EVIOCGRAB,1)<0){reject(event,4);io(pad,_IO(2),0);closefd(pad);closefd(hid);closefd(src);continue;}
+        struct controller *c=&controllers[slot];zero(c,sizeof(*c));
+        c->src=src;c->hid=hid;c->pad=pad;c->event_index=event;c->profile=profile;c->active=1;
+        copy(c->hid_parent,parent);
+        rejected[event]=0;
+        say("Xbox Bluetooth rumble bridge active\n");
+    }
+}
+static int handle_ff(struct controller *c,struct input_event *e,s64 now){
+    long pad=c->pad;
     if(e->type==EV_UINPUT&&e->code==UI_FF_UPLOAD){
         struct upload u;zero(&u,sizeof(u));u.request_id=e->value;
         if(io(pad,_IOWR(200,104),(long)&u)>=0){
             int id=u.effect.id;
             if(id>=0&&id<16&&u.effect.type==FF_RUMBLE){
-                effects[id].strong=(u16)u.effect.data[0]|((u16)u.effect.data[1]<<8);
-                effects[id].weak=(u16)u.effect.data[2]|((u16)u.effect.data[3]<<8);
-                effects[id].length=u.effect.length;
-                effects[id].delay=u.effect.delay;
+                c->effects[id].strong=(u16)u.effect.data[0]|((u16)u.effect.data[1]<<8);
+                c->effects[id].weak=(u16)u.effect.data[2]|((u16)u.effect.data[3]<<8);
+                c->effects[id].length=u.effect.length;
+                c->effects[id].delay=u.effect.delay;
                 u.retval=0;
             }else u.retval=-22;
-            io(pad,_IOW(201,104),(long)&u);
-        }
+            if(io(pad,_IOW(201,104),(long)&u)<0)return -1;
+        }else return -1;
     }else if(e->type==EV_UINPUT&&e->code==UI_FF_ERASE){
         struct erase r;zero(&r,sizeof(r));r.request_id=e->value;
         if(io(pad,_IOWR(202,12),(long)&r)>=0){
-            if(r.effect_id<16){zero(&effects[r.effect_id],sizeof(effects[0]));r.retval=0;}
+            if(r.effect_id<16){zero(&c->effects[r.effect_id],sizeof(c->effects[0]));r.retval=0;}
             else r.retval=-22;
-            io(pad,_IOW(203,12),(long)&r);
-        }
+            if(io(pad,_IOW(203,12),(long)&r)<0)return -1;
+        }else return -1;
     }else if(e->type==EV_FF){
         int id=e->code;
         if(id>=0&&id<16){
-            if(e->value>0)play_effect(&effects[id],now_ms(),e->value);
-            else effects[id].active=0;
-            update_rumble();
+            if(e->value>0)play_effect(&c->effects[id],now,e->value);
+            else c->effects[id].active=0;
+            return update_rumble(c,now);
         }
     }
+    return 0;
 }
-static int run(void){
-    char hid_parent[256];long src=source(hid_parent);if(src<0)return 1;
-    hid=hidraw(hid_parent);if(hid<0){say("Bluetooth hidraw not accessible or unsupported\n");closefd(src);return 2;}
-    u8 clear_report[9];int clear_size=make_report(profile,0,0,clear_report);
-    if(wr(hid,clear_report,clear_size)!=clear_size){say("Initial stop report failed\n");closefd(src);closefd(hid);return 2;}
-    long pad=virtual_pad(src);if(pad<0){say("Could not create uinput pad\n");closefd(src);closefd(hid);return 3;}
-    if(io(src,EVIOCGRAB,1)<0){say("Could not grab original gamepad\n");io(pad,_IO(2),0);closefd(pad);closefd(src);closefd(hid);return 4;}
-    say("Xbox Bluetooth rumble bridge active\n");
-    struct pollfd pf[2]={{(s32)src,1,0},{(s32)pad,1,0}};
-    while(1){
-        struct timespec timeout={0,20000000};
-        long n=sc4(SYS_ppoll,(long)pf,2,(long)&timeout,0);
-        if(n<0){say("poll failed\n");break;}
-        if(pf[0].revents&1){
-            struct input_event ev[32];long count=rd(src,ev,sizeof(ev));
-            if(count<=0)break;
-            for(long i=0;i<count/(long)sizeof(ev[0]);i++){
-                if(ev[i].type==EV_KEY||ev[i].type==EV_ABS||ev[i].type==0)
-                    wr(pad,&ev[i],sizeof(ev[i]));
-            }
+static s64 next_effect_deadline(s64 now){
+    s64 deadline=next_scan;
+    for(int i=0;i<MAX_CONTROLLERS;i++)if(controllers[i].active)
+        for(int j=0;j<16;j++){
+            struct rumble_effect *e=&controllers[i].effects[j];
+            if(!e->active)continue;
+            if(e->start>now&&e->start<deadline)deadline=e->start;
+            if(e->end>now&&e->end<deadline)deadline=e->end;
         }
-        if(pf[1].revents&1){
-            struct input_event ev[32];long count=rd(pad,ev,sizeof(ev));
-            for(long i=0;i<count/(long)sizeof(ev[0]);i++)handle_ff(pad,&ev[i]);
-        }
-        update_rumble();
-        if((pf[0].revents|pf[1].revents)&(8|16|32))break;
+    return deadline;
+}
+static int read_source(struct controller *c){
+    struct input_event ev[32];long count=rd(c->src,ev,sizeof(ev));
+    if(count<=0||count%(long)sizeof(ev[0]))return -1;
+    for(long i=0;i<count/(long)sizeof(ev[0]);i++)
+        if(ev[i].type==EV_KEY||ev[i].type==EV_ABS||ev[i].type==0)
+            if(wr(c->pad,&ev[i],sizeof(ev[i]))!=(long)sizeof(ev[i]))return -1;
+    return 0;
+}
+static int read_pad(struct controller *c,s64 now){
+    struct input_event ev[32];long count=rd(c->pad,ev,sizeof(ev));
+    if(count<=0||count%(long)sizeof(ev[0]))return -1;
+    for(long i=0;i<count/(long)sizeof(ev[0]);i++)if(handle_ff(c,&ev[i],now)<0)return -1;
+    return 0;
+}
+static int bridge_step(void){
+    s64 now=now_ms();
+    if(now>=next_scan){scan_sources();next_scan=now+SCAN_INTERVAL_MS;}
+    struct pollfd pf[MAX_CONTROLLERS*2];int slots[MAX_CONTROLLERS*2],kind[MAX_CONTROLLERS*2],count=0;
+    for(int i=0;i<MAX_CONTROLLERS;i++)if(controllers[i].active){
+        pf[count]=(struct pollfd){(s32)controllers[i].src,1,0};slots[count]=i;kind[count++]=0;
+        pf[count]=(struct pollfd){(s32)controllers[i].pad,1,0};slots[count]=i;kind[count++]=1;
     }
-    stop();io(src,EVIOCGRAB,0);io(pad,_IO(2),0);closefd(pad);closefd(src);closefd(hid);
-    return 5;
+    s64 deadline=next_effect_deadline(now);s64 wait=deadline-now;if(wait<0)wait=0;
+    struct timespec timeout={wait/1000,(wait%1000)*1000000};
+    long ready=sc4(SYS_ppoll,(long)pf,count,(long)&timeout,0);
+    if(ready<0){if(ready==-4)return 0;say("poll failed\n");return -1;}
+    now=now_ms();
+    for(int p=0;p<count;p++){
+        struct controller *c=&controllers[slots[p]];
+        if(!c->active)continue;
+        if(pf[p].revents&(8|16|32)){close_controller(c);continue;}
+        if(!(pf[p].revents&1))continue;
+        int result=kind[p]?read_pad(c,now):read_source(c);
+        if(result<0)close_controller(c);
+    }
+    for(int i=0;i<MAX_CONTROLLERS;i++)if(controllers[i].active)
+        if(update_rumble(&controllers[i],now)<0)close_controller(&controllers[i]);
+    return 0;
 }
-void _start(void){int code=run();sc3(SYS_exit,code,0,0);for(;;);}
+#ifndef BRIDGE_TEST
+void _start(void){while(bridge_step()==0){}for(int i=0;i<MAX_CONTROLLERS;i++)close_controller(&controllers[i]);sc3(SYS_exit,1,0,0);for(;;);}
+#endif

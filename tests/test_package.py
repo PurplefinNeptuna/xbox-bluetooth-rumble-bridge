@@ -44,6 +44,13 @@ class PackageTest(unittest.TestCase):
                         "-o", str(output), str(ROOT / "tests/core_test.c")], check=True)
         subprocess.run([str(output)], check=True)
 
+    def test_multi_controller_logic(self):
+        output = ROOT / "dist/multi_test"
+        subprocess.run(["clang", "-std=c11", "-Wall", "-Wextra", "-Werror",
+                        "-Wno-unused-function", "-o", str(output),
+                        str(ROOT / "tests/multi_test.c")], check=True)
+        subprocess.run([str(output)], check=True)
+
     def test_installer_policies(self):
         original = (ROOT / "module/sepolicy.rule").read_text()
         for manager, expected in (("KSU", original),

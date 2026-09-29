@@ -8,10 +8,10 @@ It targets Bluetooth devices reporting `045e:02fd`, including third-party
 controllers that use that ID.
 
 The verified device is a GuliKit TT Max in **Bluetooth Android mode** on a
-Samsung SM-X810 running Android 16 and KernelSU Next. Eden was used for the
-game test. Other `045e:02fd` devices, Magisk, APatch, and other Android builds
-have not been tested. A shared vendor and product ID does not prove two
-controllers use the same output report.
+Samsung SM-X810 running Android 16 and KernelSU Next. A gamepad tester was used
+for input and vibration checks. Other `045e:02fd` devices, Magisk, APatch, and
+other Android builds have not been tested. A shared vendor and product ID does
+not prove two controllers use the same output report.
 
 ## Why a bridge is needed
 
@@ -27,20 +27,22 @@ translate scan codes to keys. They do not add force feedback or change a
 Bluetooth controller's output protocol.
 
 ```text
-controller buttons and sticks -> evdev -> bridge -> virtual gamepad -> Android / Eden
-controller motors             <- HID   <- bridge <- FF_RUMBLE       <- Android / Eden
+controller buttons and sticks -> evdev -> bridge -> virtual gamepad -> Android apps
+controller motors             <- HID   <- bridge <- FF_RUMBLE       <- Android apps
 ```
 
 The bridge matches Bluetooth `045e:02fd` input to a hidraw node belonging to
-the same HID device. It reads that device's HID descriptor to select a known
-report shape: the TT Max's tested nine-byte report or the seven-byte Xbox
+the same HID device. Each matching controller gets its own virtual gamepad and
+rumble state, up to eight controllers at once. The bridge reads each HID
+descriptor to select a known report shape: the TT Max's tested nine-byte report
+or the seven-byte Xbox
 Bluetooth report described by the [Linux Microsoft HID driver](https://github.com/torvalds/linux/blob/master/drivers/hid/hid-microsoft.c).
 If neither shape is present, the bridge logs the unsupported report and leaves
 the controller alone. Report shape is only a compatibility check; hardware
 testing is still needed before another controller can be called supported.
 
-The bridge copies the physical gamepad's keys and axes into a virtual `uinput`
-device, then grabs and forwards its input events. The virtual device advertises
+The bridge copies each physical gamepad's keys and axes into a virtual `uinput`
+device, then grabs and forwards its input events. Each virtual device advertises
 `FF_RUMBLE` and retains the Xbox vendor and product ID for Android's existing
 button layout. Two motor magnitudes are scaled and rounded separately. When
 effects overlap, the highest requested strength for each motor wins. Each
@@ -62,23 +64,31 @@ behavior with this bridge remains unverified.
 1. If `TT Max Bluetooth Rumble Bridge` (`v0.2.0`) is installed, remove or
    disable it in your root manager and reboot. The new module has a different
    ID; running both would make them compete for the same controller.
-2. Download `xbox-bluetooth-rumble-bridge-v0.3.0.zip` from the release and
+2. Download `xbox-bluetooth-rumble-bridge-v0.4.0.zip` from the release and
    install it in your root manager's Modules screen. Reboot.
 3. Pair the controller over Bluetooth. For the TT Max, select **Android mode**.
-4. In Eden's Player 1 controls, choose **Xbox Bluetooth Rumble Bridge** and
+4. In a gamepad tester or game, choose **Xbox Bluetooth Rumble Bridge** and
    enable controller vibration. The renamed virtual device may require you to
    redo your button mapping.
 
 In a gamepad tester, select **Xbox Bluetooth Rumble Bridge** and verify its
 buttons, sticks, and vibration. Test a short vibration and confirm that the
-motors stop. On the tested KernelSU Next tablet, the module starts after boot
-and retries when the controller reconnects. It currently bridges one
-controller at a time.
+motors stop. The physical controller also appears in device lists because
+grabbing its events does not remove it from Android. Choose the bridge entry;
+the physical entry remains available if the bridge cannot start. On the tested
+KernelSU Next tablet, the module starts after boot and retries when the
+controller reconnects.
 
 The `v0.3.0` ZIP was installed on the tested tablet after removing `v0.2.0`.
-After reboot, Eden controls and rumble worked. Separate motor pulses, a
-three-second pulse, overlapping effects, and their stop times were checked
-through the virtual input device.
+After reboot, controls and rumble worked in a gamepad tester. Separate motor
+pulses, a three-second pulse, overlapping effects, and their stop times were
+checked through the virtual input device.
+
+The exact `v0.4.0` ZIP was installed on the same tablet. In a gamepad tester,
+buttons, sticks, both motors, and a short vibration's stop were checked. The
+virtual pad disappeared when the TT Max was powered off, returned after it
+reconnected, and passed another input and rumble check. Operation with two
+physical controllers remains unverified.
 
 For diagnostics, read
 `/data/adb/modules/xbox-bluetooth-rumble-bridge/bridge.log` through your root
@@ -99,7 +109,7 @@ On a Linux host with Clang, LLD, and Python 3:
 ./build.sh
 sh -n build.sh module/service.sh module/customize.sh
 python3 -m unittest discover -s tests -v
-sha256sum dist/xbox-bluetooth-rumble-bridge-v0.3.0.zip
+sha256sum dist/xbox-bluetooth-rumble-bridge-v0.4.0.zip
 ```
 
 Generated binaries and ZIPs stay in the ignored `dist/` directory. CI checks
@@ -112,14 +122,12 @@ publication.
 
 - Bluetooth `045e:02fd` is the only discovery ID. Other Xbox product IDs,
   wired modes, and the TT Max's Switch mode are outside this release.
-- With two matching Bluetooth gamepads connected, the bridge selects the first
-  matching input event node it scans and creates one virtual controller for
-  it. The other gamepad stays on its normal Android input path; this module
-  adds no rumble to that second pad. The selected pad's HID output is matched
-  to its own physical device, so its rumble is not sent to the other pad.
-  If the selected pad disconnects, the service retries and may then select
-  the remaining one. If the first pad has an unsupported HID report, retries
-  keep selecting it and a compatible second pad may never be reached.
+- Up to eight matching Bluetooth gamepads can be bridged at once. The bridge
+  scans every two seconds for new controllers. An unsupported controller is
+  left on its normal Android input path and does not block later matches.
+  Each virtual gamepad sends rumble to its own physical device. Simultaneous
+  use with two physical controllers has not been tested. Android or a game may
+  assign different player numbers after controllers reconnect.
 - The two main `FF_RUMBLE` motor strengths are separate. Trigger motors,
   motion sensors, consumer-control buttons, and Switch HD rumble are not
   forwarded. An app must send two distinct strengths to use the motors
