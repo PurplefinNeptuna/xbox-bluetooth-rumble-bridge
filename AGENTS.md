@@ -1,9 +1,10 @@
 # Project guidance
 
-This repository contains a root service for the GuliKit TT Max in Bluetooth
-Android mode. The tested path is a Samsung SM-X810 running KernelSU Next.
+This repository contains a root service for Bluetooth 045e:02fd gamepads.
+The tested path is a GuliKit TT Max in Android mode on a Samsung SM-X810
+running KernelSU Next. Other controllers and root managers are experimental.
 
-- Keep `src/ttmax_bridge.c` behavior and the module's SELinux rules in sync with
+- Keep `src/xbox_bridge.c` behavior and the module's SELinux rules in sync with
   the README. Treat controller modes and device IDs as tested facts, not as
   general compatibility claims.
 - Build with `./build.sh`. It writes generated files to `dist/`, which stays

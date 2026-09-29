@@ -1,12 +1,9 @@
-// TT Max Android Bluetooth -> Android uinput gamepad with FF_RUMBLE.
+// Bluetooth 045e:02fd -> Android uinput gamepad with FF_RUMBLE.
 // Standalone arm64 Linux program; built without libc for the tablet.
-typedef unsigned char u8;
-typedef unsigned short u16;
+#include "bridge_core.h"
 typedef signed short s16;
-typedef unsigned int u32;
 typedef signed int s32;
 typedef unsigned long u64;
-typedef signed long s64;
 
 #define SYS_ioctl 29
 #define SYS_openat 56
@@ -52,7 +49,8 @@ static void say(const char *s){u64 n=0;while(s[n])n++;wr(2,s,n);}
 static void zero(void *p,u64 n){u8 *b=p;for(u64 i=0;i<n;i++)b[i]=0;}
 static u64 len(const char *s){u64 n=0;while(s[n])n++;return n;}
 static void copy(char *d,const char *s){while((*d++=*s++));}
-static int contains(const char *s,const char *n){for(;*s;s++){const char *a=s,*b=n;while(*a&&*b&&*a==*b){a++;b++;}if(!*b)return 1;}return 0;}
+static int equal(const char *a,const char *b){while(*a&&*a==*b){a++;b++;}return *a==*b;}
+static const char *leaf(const char *s){const char *p=s;for(;*s;s++)if(*s=='/')p=s+1;return p;}
 static void number(char *p,int i){char b[12];int n=0;do{b[n++]='0'+i%10;i/=10;}while(i);while(n)*p++=b[--n];*p=0;}
 static u64 ioc(int dir,int type,int nr,int size){return ((u64)dir<<30)|((u64)size<<16)|((u64)type<<8)|nr;}
 #define _IO(n) ioc(0,'U',n,0)
@@ -79,38 +77,57 @@ _Static_assert(sizeof(struct input_event)==24,"input_event ABI");
 _Static_assert(sizeof(struct ff_effect)==48,"ff_effect ABI");
 _Static_assert(sizeof(struct upload)==104,"uinput upload ABI");
 
-static u16 strong[16],weak[16],length_ms[16];
+static struct rumble_effect effects[16];
 static long hid=-1;
-static s64 stop_at=0;
-static u8 playing_strong=0,playing_weak=0;
+static enum report_profile profile=REPORT_UNKNOWN;
+static u16 playing_strong=0,playing_weak=0;
 static s64 now_ms(void){struct timespec t;if(sc3(SYS_clock_gettime,CLOCK_MONOTONIC,(long)&t,0)<0)return 0;return t.sec*1000+t.nsec/1000000;}
-static void rumble(u8 a,u8 b){
-    // Report 3, both main motors enabled. Explicit zero report is required.
-    u8 pkt[9]={3,3,0,0,a,b,0,0,1};
-    if(hid>=0&&wr(hid,pkt,9)==9){playing_strong=a;playing_weak=b;}
+static void rumble(u16 a,u16 b){
+    if(a==playing_strong&&b==playing_weak)return;
+    u8 pkt[9];int n=make_report(profile,a,b,pkt);
+    if(hid>=0&&n&&wr(hid,pkt,n)==n){playing_strong=a;playing_weak=b;}
+    else say("rumble report write failed\n");
 }
-static void stop(void){if(playing_strong||playing_weak)rumble(0,0);stop_at=0;}
+static void stop(void){if(playing_strong||playing_weak)rumble(0,0);}
+static void update_rumble(void){u16 a,b;mix_effects(effects,16,now_ms(),&a,&b);rumble(a,b);}
 static int bit(const u8 *b,int k){return (b[k/8]>>(k%8))&1;}
-static long source(void){
-    char path[48],num[12],name[96];struct input_id id;
+static long source(char *hid_parent){
+    char path[96],num[12],name[96],parent[256];struct input_id id;
     for(int i=0;i<64;i++){
         copy(path,"/dev/input/event");number(num,i);copy(path+len(path),num);
         long f=op(path,O_RDONLY);
         if(f<0)continue;
         zero(&id,sizeof(id));zero(name,sizeof(name));
         if(io(f,EVIOCGID,(long)&id)>=0&&id.bustype==5&&id.vendor==0x045e&&id.product==0x02fd&&
-           io(f,EVIOCGNAME(96),(long)name)>0&&contains(name,"GuliKit Controller AD"))return f;
+           io(f,EVIOCGNAME(96),(long)name)>0&&
+           !equal(name,"Xbox Bluetooth Rumble Bridge")&& !equal(name,"TT Max Rumble Bridge")){
+            u8 keys[96];zero(keys,sizeof(keys));
+            if(io(f,EVIOCGBIT(EV_KEY,sizeof(keys)),(long)keys)>=0&&bit(keys,304)){
+                copy(path,"/sys/class/input/event");number(num,i);copy(path+len(path),num);
+                copy(path+len(path),"/device/device");
+                long n=sc4(SYS_readlinkat,AT_FDCWD,(long)path,(long)parent,255);
+                if(n>0){parent[n]=0;copy(hid_parent,leaf(parent));return f;}
+            }
+        }
         closefd(f);
     }
     return -1;
 }
-static long hidraw(void){
-    char path[80],num[12],link[256];
+static long hidraw(const char *hid_parent){
+    char path[128],num[12],link[256];
     for(int i=0;i<64;i++){
         copy(path,"/sys/class/hidraw/hidraw");number(num,i);copy(path+len(path),num);copy(path+len(path),"/device");
         long n=sc4(SYS_readlinkat,AT_FDCWD,(long)path,(long)link,255);
         if(n<=0)continue;link[n]=0;
-        if(contains(link,"045E:02FD")||contains(link,"045e:02fd")){
+        if(equal(leaf(link),hid_parent)){
+            copy(path,"/sys/class/hidraw/hidraw");copy(path+len(path),num);
+            copy(path+len(path),"/device/report_descriptor");
+            long d=op(path,O_RDONLY);
+            if(d<0){say("HID descriptor not readable\n");return -1;}
+            u8 descriptor[2048];long size=rd(d,descriptor,sizeof(descriptor));closefd(d);
+            if(size<=0||size==(long)sizeof(descriptor)){say("HID descriptor invalid\n");return -1;}
+            profile=report_profile_from_descriptor(descriptor,(u32)size);
+            if(profile==REPORT_UNKNOWN){say("Unsupported HID output report 3; leaving controller untouched\n");return -1;}
             copy(path,"/dev/hidraw");copy(path+len(path),num);
             return op(path,O_WRONLY);
         }
@@ -129,7 +146,7 @@ static long virtual_pad(long src){
     }
     struct setup s;zero(&s,sizeof(s));
     s.id.bustype=5;s.id.vendor=0x045e;s.id.product=0x02fd;s.id.version=0x0903;
-    copy(s.name,"TT Max Rumble Bridge");s.max_effects=16;
+    copy(s.name,"Xbox Bluetooth Rumble Bridge");s.max_effects=16;
     if(io(f,_IOW(3,92),(long)&s)<0||io(f,_IO(1),0)<0)goto fail;
     return f;
 fail:closefd(f);return -1;
@@ -140,9 +157,10 @@ static void handle_ff(long pad,struct input_event *e){
         if(io(pad,_IOWR(200,104),(long)&u)>=0){
             int id=u.effect.id;
             if(id>=0&&id<16&&u.effect.type==FF_RUMBLE){
-                strong[id]=(u16)u.effect.data[0]|((u16)u.effect.data[1]<<8);
-                weak[id]=(u16)u.effect.data[2]|((u16)u.effect.data[3]<<8);
-                length_ms[id]=u.effect.length;
+                effects[id].strong=(u16)u.effect.data[0]|((u16)u.effect.data[1]<<8);
+                effects[id].weak=(u16)u.effect.data[2]|((u16)u.effect.data[3]<<8);
+                effects[id].length=u.effect.length;
+                effects[id].delay=u.effect.delay;
                 u.retval=0;
             }else u.retval=-22;
             io(pad,_IOW(201,104),(long)&u);
@@ -150,27 +168,27 @@ static void handle_ff(long pad,struct input_event *e){
     }else if(e->type==EV_UINPUT&&e->code==UI_FF_ERASE){
         struct erase r;zero(&r,sizeof(r));r.request_id=e->value;
         if(io(pad,_IOWR(202,12),(long)&r)>=0){
-            if(r.effect_id<16){strong[r.effect_id]=weak[r.effect_id]=length_ms[r.effect_id]=0;r.retval=0;}
+            if(r.effect_id<16){zero(&effects[r.effect_id],sizeof(effects[0]));r.retval=0;}
             else r.retval=-22;
             io(pad,_IOW(203,12),(long)&r);
         }
     }else if(e->type==EV_FF){
         int id=e->code;
-        if(id>=0&&id<16&&e->value>0){
-            u8 a=strong[id]>>8,b=weak[id]>>8;
-            rumble(a,b);
-            int duration=length_ms[id];if(duration<50)duration=50;if(duration>1000)duration=1000;
-            stop_at=now_ms()+duration;
-        }else if(e->value==0)stop();
+        if(id>=0&&id<16){
+            if(e->value>0)play_effect(&effects[id],now_ms(),e->value);
+            else effects[id].active=0;
+            update_rumble();
+        }
     }
 }
 static int run(void){
-    long src=source();if(src<0)return 1;
-    hid=hidraw();if(hid<0){say("TT Max Bluetooth hidraw not accessible\n");closefd(src);return 2;}
-    rumble(0,0);
+    char hid_parent[256];long src=source(hid_parent);if(src<0)return 1;
+    hid=hidraw(hid_parent);if(hid<0){say("Bluetooth hidraw not accessible or unsupported\n");closefd(src);return 2;}
+    u8 clear_report[9];int clear_size=make_report(profile,0,0,clear_report);
+    if(wr(hid,clear_report,clear_size)!=clear_size){say("Initial stop report failed\n");closefd(src);closefd(hid);return 2;}
     long pad=virtual_pad(src);if(pad<0){say("Could not create uinput pad\n");closefd(src);closefd(hid);return 3;}
     if(io(src,EVIOCGRAB,1)<0){say("Could not grab original gamepad\n");io(pad,_IO(2),0);closefd(pad);closefd(src);closefd(hid);return 4;}
-    say("TT Max rumble bridge active\n");
+    say("Xbox Bluetooth rumble bridge active\n");
     struct pollfd pf[2]={{(s32)src,1,0},{(s32)pad,1,0}};
     while(1){
         struct timespec timeout={0,20000000};
@@ -188,7 +206,7 @@ static int run(void){
             struct input_event ev[32];long count=rd(pad,ev,sizeof(ev));
             for(long i=0;i<count/(long)sizeof(ev[0]);i++)handle_ff(pad,&ev[i]);
         }
-        if(stop_at&&now_ms()>=stop_at)stop();
+        update_rumble();
         if((pf[0].revents|pf[1].revents)&(8|16|32))break;
     }
     stop();io(src,EVIOCGRAB,0);io(pad,_IO(2),0);closefd(pad);closefd(src);closefd(hid);

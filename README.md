@@ -1,136 +1,146 @@
-# TT Max Bluetooth rumble bridge
+# Xbox Bluetooth Rumble Bridge
 
-The GuliKit TT Max has working motors, but on our rooted Android tablet its
-Bluetooth Android mode appeared to games as a controller without rumble. This
-KernelSU Next module gives that mode an Android gamepad with a vibrator and
-forwards vibration commands to the TT Max over Bluetooth. The goal is simple:
-working Xbox-style rumble without a cable.
+Some Bluetooth gamepads report themselves to Android as Xbox controllers but
+arrive without a usable vibrator. Their buttons work in games; vibration does
+not. This root module creates a virtual Android gamepad with `FF_RUMBLE` and
+passes each rumble command to the physical controller through Bluetooth HID.
+It targets Bluetooth devices reporting `045e:02fd`, including third-party
+controllers that use that ID.
 
-This is a device-specific bridge. It was developed and tested with a GuliKit
-TT Max in **Bluetooth Android mode** (`045e:02fd`) on a Samsung SM-X810 running
-Android 16 and KernelSU Next. Eden was used for the in-game test. Other
-controllers, modes, and Android builds have not been verified.
+The verified device is a GuliKit TT Max in **Bluetooth Android mode** on a
+Samsung SM-X810 running Android 16 and KernelSU Next. Eden was used for the
+game test. Other `045e:02fd` devices, Magisk, APatch, and other Android builds
+have not been tested. A shared vendor and product ID does not prove two
+controllers use the same output report.
 
-## What led to the bridge
+## Why a bridge is needed
 
-The controller's behavior changed with its connection mode:
+On the tested tablet, the TT Max's Bluetooth Android mode exposed buttons and
+sticks but no `EV_FF` capability. Android therefore told gamepad testers and
+games that the controller had no vibration motor. A direct report to its
+`/dev/hidraw` device started both motors; a zero-strength report stopped them.
+The motors and Bluetooth output path worked, while the input device offered no
+force feedback interface to Android.
 
-| Connection | Android sees | Rumble result |
-| --- | --- | --- |
-| Bluetooth Android mode | `GuliKit Controller AD`, `045e:02fd` | Buttons and sticks worked; Android exposed no `EV_FF` motor. |
-| Bluetooth NS mode | `Nintendo Switch Pro Controller`, `057e:2009` | Buttons worked; Android exposed no `EV_FF` motor. |
-| USB PC mode | `Microsoft X-Box 360 pad`, `045e:028e` | The kernel's `xpad` driver exposed `FF_RUMBLE`; a gamepad tester drove the physical motors. |
-
-On the tested tablet, Bluetooth Android mode also created a `/dev/hidraw`
-device. A direct output report sent through that device started the motors. A
-second report with zero motor strength stopped them. That established a usable
-Bluetooth output path even though Android did not offer one to games.
-
-We initially considered replacing an Xbox `.kl` key layout with a PlayStation
-layout. [Android key layout files](https://source.android.com/docs/core/interaction/input/key-layout-files)
-translate input scan codes into Android key codes. They do not add a force
-feedback device or change the controller's Bluetooth output protocol. The
-bridge addresses the missing output path instead.
-
-## How it works
+Replacing an Xbox `.kl` file cannot fix this. [Android key layout files](https://source.android.com/docs/core/interaction/input/key-layout-files)
+translate scan codes to keys. They do not add force feedback or change a
+Bluetooth controller's output protocol.
 
 ```text
-TT Max buttons and sticks -> evdev -> bridge -> uinput gamepad -> Android / Eden
-TT Max motors            <- hidraw <- bridge <- FF_RUMBLE    <- Android / Eden
+controller buttons and sticks -> evdev -> bridge -> virtual gamepad -> Android / Eden
+controller motors             <- HID   <- bridge <- FF_RUMBLE       <- Android / Eden
 ```
 
-The arm64 bridge finds the TT Max by its Bluetooth bus, `045e:02fd` ID, and
-`GuliKit Controller AD` input name. It copies the physical device's key and
-axis capabilities to a virtual gamepad made with Linux
-[`uinput`](https://docs.kernel.org/input/uinput.html). It grabs the physical
-input stream and forwards button, axis, and synchronization events to the
-virtual device, so Android receives one working set of controls. The virtual
-device advertises `FF_RUMBLE`, which makes Android list it as a gamepad with a
-vibrator. It uses the same vendor and product ID so the tablet's existing Xbox
-key layout still maps its buttons.
+The bridge matches Bluetooth `045e:02fd` input to a hidraw node belonging to
+the same HID device. It reads that device's HID descriptor to select a known
+report shape: the TT Max's tested nine-byte report or the seven-byte Xbox
+Bluetooth report described by the [Linux Microsoft HID driver](https://github.com/torvalds/linux/blob/master/drivers/hid/hid-microsoft.c).
+If neither shape is present, the bridge logs the unsupported report and leaves
+the controller alone. Report shape is only a compatibility check; hardware
+testing is still needed before another controller can be called supported.
 
-When an app uploads and plays a rumble effect, the bridge converts its strong
-and weak motor magnitudes to the TT Max's tested Bluetooth HID report. It sends
-an explicit zero-strength report when playback stops. While the process is
-running, it also stops an effect after its requested duration, capped at one
-second. The timeout matters because the direct HID test showed that the
-controller can keep vibrating until it receives a stop report. An abrupt
-process kill cannot provide that guarantee; power off the controller if the
-motors ever continue unexpectedly.
+The bridge copies the physical gamepad's keys and axes into a virtual `uinput`
+device, then grabs and forwards its input events. The virtual device advertises
+`FF_RUMBLE` and retains the Xbox vendor and product ID for Android's existing
+button layout. Two motor magnitudes are scaled and rounded separately. When
+effects overlap, the highest requested strength for each motor wins. Each
+effect has its own start and stop time, with at most **3000 ms** of playback.
+The bridge sends an explicit stop report when both motors are idle. A forced
+process kill or a lost Bluetooth connection can prevent that last report; turn
+the controller off if vibration continues unexpectedly.
 
-The KernelSU service waits for Android to finish booting, then starts the
-bridge when the TT Max is present. It retries after disconnection, so a later
-Bluetooth reconnection creates a fresh virtual gamepad. It changes no system
-key layout files. The bridge itself is a small, statically linked arm64 program
-that uses Linux syscalls directly; the build does not need the Android NDK.
+## Install or upgrade
 
-## Install
+The ZIP contains an arm64 program and a boot service. Install it from the
+**Modules** screen in KernelSU Next, Magisk, or APatch; do not flash it from
+recovery. KernelSU Next is the only manager tested with this project. The
+[Magisk module guide](https://topjohnwu.github.io/Magisk/guides.html) and
+[APatch module guide](https://apatch.dev/apm-guide.html) describe the same
+`service.sh` and `customize.sh` hooks used by this package. Their runtime
+behavior with this bridge remains unverified.
 
-1. Download `ttmax-rumble-bridge-v0.2.0.zip` from the GitHub release.
-2. Install the ZIP in KernelSU Next's Modules screen and reboot.
-3. Pair the TT Max with the Android tablet in **Bluetooth Android mode**.
-4. In Eden's Player 1 controls, choose **TT Max Rumble Bridge** and enable
-   controller vibration.
+1. If `TT Max Bluetooth Rumble Bridge` (`v0.2.0`) is installed, remove or
+   disable it in your root manager and reboot. The new module has a different
+   ID; running both would make them compete for the same controller.
+2. Download `xbox-bluetooth-rumble-bridge-v0.3.0.zip` from the release and
+   install it in your root manager's Modules screen. Reboot.
+3. Pair the controller over Bluetooth. For the TT Max, select **Android mode**.
+4. In Eden's Player 1 controls, choose **Xbox Bluetooth Rumble Bridge** and
+   enable controller vibration. The renamed virtual device may require you to
+   redo your button mapping.
 
-The virtual pad should also appear in a gamepad tester. Select **TT Max Rumble
-Bridge**, check a button and stick, then try its rumble control. The physical
-motors should start and stop. The `v0.2.0` ZIP was installed on the tested
-tablet, followed by a reboot. Eden controls and physical rumble worked after
-the controller reconnected, and the rumble stopped normally.
+In a gamepad tester, select **Xbox Bluetooth Rumble Bridge** and verify its
+buttons, sticks, and vibration. Test a short vibration and confirm that the
+motors stop. On the tested KernelSU Next tablet, the module starts after boot
+and retries when the controller reconnects. It currently bridges one
+controller at a time.
 
-If you have ADB, `adb shell dumpsys input` should list the bridge with a
-`VIBRATOR` class. The service writes diagnostics to
-`/data/adb/modules/ttmax-rumble-bridge/bridge.log`.
+The `v0.3.0` ZIP was installed on the tested tablet after removing `v0.2.0`.
+After reboot, Eden controls and rumble worked. Separate motor pulses, a
+three-second pulse, overlapping effects, and their stop times were checked
+through the virtual input device.
 
-To disable or remove the module, use KernelSU Next's Modules screen and
-reboot. The original controller input path returns when the bridge is no
-longer running.
+For diagnostics, read
+`/data/adb/modules/xbox-bluetooth-rumble-bridge/bridge.log` through your root
+manager or a permitted root shell. If the virtual controller does not appear,
+check its Bluetooth mode, the module's enabled state, and the log. Messages
+about an unreadable HID descriptor or an unsupported report mean the bridge
+left that controller alone. If controls work but a game does not vibrate,
+select the virtual controller in the game and enable its vibration setting.
 
-## Build from source
+To remove the bridge, disable or uninstall its module in the root manager and
+reboot. The physical controller will then use its normal Android input path.
 
-On a Linux host, install Clang, LLD, and Python 3, then run:
+## Build and test
+
+On a Linux host with Clang, LLD, and Python 3:
 
 ```sh
 ./build.sh
+sh -n build.sh module/service.sh module/customize.sh
 python3 -m unittest discover -s tests -v
-sha256sum dist/ttmax-rumble-bridge-v0.2.0.zip
+sha256sum dist/xbox-bluetooth-rumble-bridge-v0.3.0.zip
 ```
 
-The build compiles `src/ttmax_bridge.c` for arm64 and packages it with the
-KernelSU module files. Outputs stay in the ignored `dist/` directory. The
-module version in `module/module.prop` determines the ZIP name. CI checks the
-same build, the archive's files and permissions, and the executable's ELF
-architecture. These checks cannot prove physical rumble; that requires a
-controller and an Android device.
+Generated binaries and ZIPs stay in the ignored `dist/` directory. CI checks
+the arm64 executable, archive contents and permissions, report encoding, and
+effect timing. A host test cannot establish that a physical controller accepts
+a report. The release ZIP must be installed and tested on a device before
+publication.
 
 ## Limits and permissions
 
-- Only the TT Max's tested Bluetooth Android mode is supported. NS mode, USB
-  mode, other controller models, and other tablets have not been validated.
-- The bridge forwards keys, axes, and synchronization events. It does not
-  forward motion sensors or the controller's separate consumer-control input.
-- Standard `FF_RUMBLE` carries two motor strengths. The bridge does not expose
-  trigger motors or the full detail of Switch HD rumble.
-- The current device search matches the HID vendor and product ID. If two
-  devices with that same ID are connected, the output path may choose the
-  wrong one.
-- `sepolicy.rule` allows KernelSU's process to read input devices, use
-  `uinput`, and write devices labeled `ovr_device`. SELinux applies these rules
-  to device types, not just this controller. Install the module only on a
-  tablet where you trust the KernelSU environment and its other modules.
+- Bluetooth `045e:02fd` is the only discovery ID. Other Xbox product IDs,
+  wired modes, and the TT Max's Switch mode are outside this release.
+- The two main `FF_RUMBLE` motor strengths are separate. Trigger motors,
+  motion sensors, consumer-control buttons, and Switch HD rumble are not
+  forwarded. An app must send two distinct strengths to use the motors
+  differently.
+- The TT Max report has eight-bit motor fields; the Xbox report specifies
+  values from 0 to 100. Rounding avoids losing small nonzero effects, but
+  cannot create more physical strength levels. Motor response is not
+  necessarily linear.
+- Effect playback is capped at three seconds. Stop timing is subject to the
+  service's polling interval and Bluetooth delivery. An abrupt process kill
+  cannot guarantee a stop report.
+- The HID descriptor selects the report layout, not guaranteed compatibility.
+  Other `045e:02fd` controllers are experimental until tested on hardware.
+- KernelSU Next is verified. Magisk and APatch install hooks are included but
+  have not been tested on either manager. Their SELinux domains and device
+  labels can differ by build.
+- The service requires root access to input, `uinput`, and hidraw devices.
+  On KernelSU Next, `sepolicy.rule` grants its `ksu` domain access to the
+  relevant device types. The installer adapts the policy for APatch's domain;
+  Magisk uses its own root-domain policy. These grants cover device types,
+  not only the paired controller, so install only in a root environment you
+  trust.
 
-If the virtual pad does not appear, confirm the TT Max is in Android mode and
-the module is enabled, then inspect `bridge.log`. If buttons work but a game
-does not rumble, check that the game uses **TT Max Rumble Bridge** and has
-controller vibration enabled. If vibration continues after a process failure,
-power off the TT Max before further testing.
+If you test another `045e:02fd` controller, a useful report includes its
+model, firmware, root manager, Android version, HID report descriptor or
+report length, and whether each motor starts and stops. Remove Bluetooth
+addresses and device serials from logs before sharing them.
 
-## Credits and references
+## Credits
 
-PurplefinNeptuna directed and tested this project. The initial bridge and
-documentation were developed with OpenAI Codex. The Bluetooth rumble report
-was checked against the [Linux HID Microsoft driver](https://github.com/torvalds/linux/blob/master/drivers/hid/hid-microsoft.c),
-then tested on the TT Max itself. Module packaging follows the
-[KernelSU module guide](https://kernelsu.org/guide/module.html).
-
-The project is released under the [MIT License](LICENSE).
+PurplefinNeptuna directed and tested the bridge. OpenAI Codex helped develop
+the code and documentation. The project is available under the [MIT License](LICENSE).

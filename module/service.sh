@@ -5,7 +5,7 @@ MODDIR=${0%/*}
         sleep 2
     done
     while [ ! -e "$MODDIR/disable" ]; do
-        "$MODDIR/ttmax_bridge" >> "$MODDIR/bridge.log" 2>&1
+        "$MODDIR/xbox_bridge" >> "$MODDIR/bridge.log" 2>&1
         sleep 2
     done
 ) </dev/null >/dev/null 2>&1 &
