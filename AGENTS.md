@@ -7,6 +7,10 @@ running KernelSU Next. Other controllers and root managers are experimental.
 - Keep `src/xbox_bridge.c` behavior and the module's SELinux rules in sync with
   the README. Treat controller modes and device IDs as tested facts, not as
   general compatibility claims.
+- The service currently bridges one controller at a time. It scans matching
+  input event nodes in order, and an unsupported first match can prevent a
+  compatible second controller from being selected. Keep this limitation
+  documented until multi-controller handling is implemented and tested.
 - Build with `./build.sh`. It writes generated files to `dist/`, which stays
   outside Git. Run `sh -n build.sh module/service.sh module/customize.sh` and
   `python3 -m unittest discover -s tests -v` before committing.

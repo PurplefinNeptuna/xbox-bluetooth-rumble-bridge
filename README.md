@@ -112,6 +112,14 @@ publication.
 
 - Bluetooth `045e:02fd` is the only discovery ID. Other Xbox product IDs,
   wired modes, and the TT Max's Switch mode are outside this release.
+- With two matching Bluetooth gamepads connected, the bridge selects the first
+  matching input event node it scans and creates one virtual controller for
+  it. The other gamepad stays on its normal Android input path; this module
+  adds no rumble to that second pad. The selected pad's HID output is matched
+  to its own physical device, so its rumble is not sent to the other pad.
+  If the selected pad disconnects, the service retries and may then select
+  the remaining one. If the first pad has an unsupported HID report, retries
+  keep selecting it and a compatible second pad may never be reached.
 - The two main `FF_RUMBLE` motor strengths are separate. Trigger motors,
   motion sensors, consumer-control buttons, and Switch HD rumble are not
   forwarded. An app must send two distinct strengths to use the motors
