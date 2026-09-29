@@ -1,0 +1,26 @@
+name: Build module
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install compiler
+        run: sudo apt-get update && sudo apt-get install -y clang lld
+      - name: Check scripts
+        run: sh -n build.sh module/service.sh module/customize.sh
+      - name: Build module
+        run: ./build.sh
+      - name: Check package
+        run: python3 -m unittest discover -s tests -v
+      - name: Upload module ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: ttmax-rumble-bridge
+          path: |
+            dist/*.zip
+            dist/*.sha256
